@@ -5,31 +5,31 @@ from queue import Queue, PriorityQueue
 import matplotlib.pyplot as plt
 from numpy import random as rnd
 import numpy as np
+import pandas as pd
 import logging
-import math
 
 # ******************************************************************************
 # Constants
 # ******************************************************************************
 
-EV_ARRIVAL = 180  # EV inter-arrival time
-CUSTOMER_ARRIVAL = 180  # customer inter-arrival time
-
 SCENARIO = 'RESIDENTIAL'
 # SCENARIO = 'BUSINESS'
 
 RND_ASSIGNMENT = True
-EXP_SERVICE_RATE = True
 
-SIM_TIME = 86400  # 24H in seconds
-FULL_CHARGE_T = 7200  # 2H in seconds
+SIM_TIME = 3600 * 12
+STARTING_TIME = 7
+FULL_CHARGE_T = 3600 * 2  # 2H in seconds
 READY_THRESHOLD = 80  # %
 W_MAX = 300  # 5m in seconds
-NSCS = 5
+NSCS = 10
+INITIAL_VEHICLES = 7
 C = 20  # kWh
-INITIAL_VEHICLES = 0
 
-k = math.log(240, SIM_TIME)
+ARRIVAL_RATE = 600
+MAX_ARRIVAL_RATE = 1000
+MIN_ARRIVAL_RATE = 60
+k = (MAX_ARRIVAL_RATE - MIN_ARRIVAL_RATE)/SIM_TIME
 
 vehicles = []
 queue = []
@@ -40,6 +40,9 @@ plugged_ev = np.array([0, 0])
 BusyServer = [False] * NSCS  # True: server is currently busy; False: server is currently idle
 ev_arrivals = []
 customer_arrivals = []
+
+season = 'SPRING'
+cost_electricity = pd.read_csv('electricity_prices.csv', names=['1', 'HOUR', '2', 'SPRING', '3', 'SUMMER', '4', 'FALL', '5', 'WINTER']).get(season)
 
 
 # ******************************************************************************
@@ -57,7 +60,9 @@ class Measure:
                  utilization=0,
                  old_time_event=0,
                  servers_usage=[0] * NSCS,
-                 power_consuption=0):
+                 power_consuption=0,
+                 electricity_cost=0,
+                 power_grid_usage=[0] * int(SIM_TIME / 3600)):
         self.arrivedVehicles = arrived_vehicles
         self.droppedVehicles = dropped_vehicle
         self.waitingVehicles = waiting_vehicles
@@ -69,6 +74,8 @@ class Measure:
         self.oldT = old_time_event
         self.busyT = servers_usage
         self.powerConsumption = power_consuption
+        self.electricityCost = electricity_cost
+        self.powerGridUsage = power_grid_usage
 
 
 # ******************************************************************************
@@ -97,10 +104,13 @@ def ev_arrival(time, FES):
 
     # sample the time until the next event
     if SCENARIO == 'RESIDENTIAL':
-        inter_arrival = random.expovariate(1 / (300 - time ** k))
+        inter_arrival = random.expovariate(1 / (MAX_ARRIVAL_RATE - time * k))
         ev_arrivals.append(time + inter_arrival)
-    if SCENARIO == 'BUSINESS':
-        inter_arrival = random.expovariate(1 / (60 + time ** k))
+    elif SCENARIO == 'BUSINESS':
+        inter_arrival = random.expovariate(1 / (MIN_ARRIVAL_RATE + time * k))
+        ev_arrivals.append(time + inter_arrival)
+    else:
+        inter_arrival = random.expovariate(1 / ARRIVAL_RATE)
         ev_arrivals.append(time + inter_arrival)
 
     # schedule the next arrival
@@ -129,17 +139,28 @@ def ev_arrival(time, FES):
 
     else:
         # If there are no free plugs, eval if it is probable that one will be available soon
-        plugs_expected_to_become_free = 0
+        available_plugs = []
         for ev in vehicles:
             # check if and eventually how long the vehicle will be ready in the nex few minutes
             if time + W_MAX >= ev.ready_time:
-                opportunity_window = W_MAX - ev.ready_time if time < ev.ready_time else W_MAX
-                if opportunity_window / CUSTOMER_ARRIVAL >= 1:
-                    plugs_expected_to_become_free += 1
+                temp = time + W_MAX - ev.ready_time if time < ev.ready_time else W_MAX
+                available_plugs.append(temp)
 
-        if plugs_expected_to_become_free > len(queue):
-            queue.append(EV(time, random.randrange(1, 100), None, None))
+        if len(available_plugs) > len(queue):
+            available_plugs.sort(reverse=True)
+            for i in range(len(queue)):
+                available_plugs.pop(0)
 
+            opportunity_window = available_plugs[0]
+
+            CUSTOMER_ARRIVAL = MIN_ARRIVAL_RATE + (time + W_MAX) * k if SCENARIO == 'RESIDENTIAL' else MAX_ARRIVAL_RATE - (time + W_MAX) * k
+            plugs_expected_to_become_free = min(int(opportunity_window / CUSTOMER_ARRIVAL), len(available_plugs))
+
+            if plugs_expected_to_become_free > len(queue):
+                queue.append(EV(time, random.randrange(1, 100), None, None))
+
+            else:
+                data.droppedVehicles += 1
         else:
             data.droppedVehicles += 1
 
@@ -153,10 +174,13 @@ def customer_arrival(time, FES):
 
     # sample the time until the next event
     if SCENARIO == 'RESIDENTIAL':
-        inter_arrival = random.expovariate(1 / (60 + time ** k))
+        inter_arrival = random.expovariate(1 / (MIN_ARRIVAL_RATE + time * k))
         customer_arrivals.append(time + inter_arrival)
-    if SCENARIO == 'BUSINESS':
-        inter_arrival = random.expovariate(1 / (300 - time ** k))
+    elif SCENARIO == 'BUSINESS':
+        inter_arrival = random.expovariate(1 / (MAX_ARRIVAL_RATE - time * k))
+        customer_arrivals.append(time + inter_arrival)
+    else:
+        inter_arrival = random.expovariate(1 / ARRIVAL_RATE)
         customer_arrivals.append(time + inter_arrival)
 
     # schedule the next arrival
@@ -183,7 +207,8 @@ def customer_arrival(time, FES):
         BusyServer[leaving_ev.scs_number] = False
         data.busyT[leaving_ev.scs_number] += service_time
         serving_delays.append(service_time)
-        data.powerConsumption += charging_level - leaving_ev.battery_level
+        data.powerConsumption += (charging_level - leaving_ev.battery_level)/100 * C
+        data.electricityCost += eval_consumption_cost(time, leaving_ev, charging_level)
         logging.info(str(time) + '|| car hired: ' + str(len(vehicles)) + '/5 dock stations used')
 
         # check if there is someone in queue to take immediately this plug
@@ -216,9 +241,40 @@ def customer_arrival(time, FES):
 
 
 # ******************************************************************************
+# useful function
+# ******************************************************************************
+def eval_consumption_cost(time, leaving_ev, charging_level):
+    if time > 3600 * 11:
+        print('')
+    start_charge_time = leaving_ev.arrival_time
+    cost = 0
+    if charging_level != 100:
+        end_charge_time = time
+    else:
+        end_charge_time = leaving_ev.arrival_time + (100 - leaving_ev.battery_level) / 100 * FULL_CHARGE_T
+    initial_band = int(start_charge_time // 3600)
+    final_band = int(end_charge_time // 3600)
+    for band in range(initial_band, final_band+1):
+        if band == initial_band and band != final_band:
+            time_in_this_band = (band + 1) * 3600 - start_charge_time
+        elif band == final_band and band != initial_band:
+            time_in_this_band = end_charge_time - band * 3600
+        elif band == initial_band and band == final_band:
+            time_in_this_band = end_charge_time - start_charge_time
+        else:
+            time_in_this_band = 3600
+        # charging percentage in this band times the total capacity of the battery is the kWh taken from grind.
+        charging_in_this_band = time_in_this_band * 100 / FULL_CHARGE_T
+        MWh = charging_in_this_band / 100 * C / 1000
+        cost += MWh * cost_electricity[band + STARTING_TIME]
+        data.powerGridUsage[band] += MWh
+    return cost
+
+# ******************************************************************************
 # the "main" of the simulation
 # ******************************************************************************
 random.seed(42)
+rnd.seed(42)
 logging.basicConfig(filename='station.log', filemode='w', level=logging.DEBUG, format='%(message)s')
 data = Measure()
 
@@ -238,8 +294,6 @@ FES.put((0, "ev_arrival"))
 
 # simulate until the simulated time reaches a constant
 while time < SIM_TIME:
-    # if time > 6340.292:
-    #     print('hi')
     plugged_ev = np.vstack([plugged_ev, [time, len(vehicles)]])
     queuing_ev = np.vstack([queuing_ev, [time, len(queue)]])
 
@@ -250,6 +304,16 @@ while time < SIM_TIME:
 
     elif event_type == "ev_arrival":
         ev_arrival(time, FES)
+
+# add to the measurements the data regarding evs plugged at the end of the simulation
+if len(vehicles) > 0:
+    for ev in vehicles:
+        service_time = time - ev.arrival_time
+        charging_level = ev.battery_level + 100 * service_time / FULL_CHARGE_T
+        if charging_level > 100:
+            charging_level = 100
+        data.busyT[ev.scs_number] += service_time
+        data.powerConsumption += (charging_level - ev.battery_level)/100 * C
 
 # print output data
 print("No. of Vehicles arrived :", data.arrivedVehicles, ' - of which served: ', data.arrivedVehicles - data.droppedVehicles)
@@ -268,12 +332,14 @@ for row in queuing_ev:
     last_time = row[0]
 mean_queue_len = mean_queue_len / time
 print('Average number of Vehicles waiting in queue: ', mean_queue_len, ' - with ', len(queue), 'actually present')
-print("Total power consumption: ", data.powerConsumption * C, ' kWh')
+print("Total power consumption: ", data.powerConsumption, ' kWh')
 print('Mean power consumption per vehicle: ', data.powerConsumption / (data.arrivedVehicles - data.droppedVehicles),
       ' kWh')
 
 for i in range(NSCS):
     print('Utilization of station ', i, ': ', data.busyT[i], ' s')
+
+print('Total energy cost: ', data.electricityCost)
 
 plt.figure()
 plt.title('ev plugged over time')
@@ -303,4 +369,20 @@ plt.show()
 plt.figure()
 plt.title('customer arrivals distribution')
 plt.hist(customer_arrivals, bins=50)
+plt.show()
+
+plt.figure()
+plt.gca().set(title='Work distributed among servers', xlabel='server', ylabel='%working time')
+plt.plot(data.busyT, marker="X")
+plt.legend()
+plt.grid()
+plt.xticks(range(NSCS))
+plt.show()
+
+plt.figure()
+plt.gca().set(title='MWh taken from power grid per time band', xlabel='time slot', ylabel='MWh absorbed')
+plt.plot(data.powerGridUsage, marker="X")
+plt.legend()
+plt.grid()
+plt.xticks(range(12))
 plt.show()
